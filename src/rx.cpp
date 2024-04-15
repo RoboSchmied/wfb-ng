@@ -1,6 +1,6 @@
 // -*- C++ -*-
 //
-// Copyright (C) 2017 - 2022 Vasily Evseenko <svpcom@p2ptech.org>
+// Copyright (C) 2017 - 2024 Vasily Evseenko <svpcom@p2ptech.org>
 
 /*
  *   This program is free software; you can redistribute it and/or modify
@@ -111,8 +111,10 @@ void Receiver::loop_iter(void)
         int pktlen = hdr.caplen;
         // int pkt_rate = 0
         int ant_idx = 0;
+        uint32_t freq = 0;
         uint8_t antenna[RX_ANT_MAX];
         int8_t rssi[RX_ANT_MAX];
+        int8_t noise[RX_ANT_MAX];
         uint8_t flags = 0;
         bool self_injected = false;
         struct ieee80211_radiotap_iterator iterator;
@@ -122,6 +124,8 @@ void Receiver::loop_iter(void)
         memset(antenna, 0xff, sizeof(antenna));
         // Fill all rssi slots with minimum value
         memset(rssi, SCHAR_MIN, sizeof(rssi));
+        // Fill all noise slots with maximum value
+        memset(noise, SCHAR_MAX, sizeof(noise));
 
         while (ret == 0 && ant_idx < RX_ANT_MAX) {
             ret = ieee80211_radiotap_iterator_next(&iterator);
@@ -145,9 +149,17 @@ void Receiver::loop_iter(void)
                 ant_idx += 1;
                 break;
 
+            case IEEE80211_RADIOTAP_CHANNEL:
+                // drop channel flags - they are redundant for freq to chan convertion
+                freq = le32toh(*(uint32_t*)(iterator.this_arg)) & 0xffff;
+                break;
+
             case IEEE80211_RADIOTAP_DBM_ANTSIGNAL:
-                // Some cards can provide rssi for multiple antennas in one packet, so we should select maximum value
                 rssi[ant_idx] = *(int8_t*)(iterator.this_arg);
+                break;
+
+            case IEEE80211_RADIOTAP_DBM_ANTNOISE:
+                noise[ant_idx] = *(int8_t*)(iterator.this_arg);
                 break;
 
             case IEEE80211_RADIOTAP_FLAGS:
@@ -191,7 +203,7 @@ void Receiver::loop_iter(void)
 
         if (pktlen > (int)sizeof(ieee80211_header))
         {
-            agg->process_packet(pkt + sizeof(ieee80211_header), pktlen - sizeof(ieee80211_header), wlan_idx, antenna, rssi, NULL);
+            agg->process_packet(pkt + sizeof(ieee80211_header), pktlen - sizeof(ieee80211_header), wlan_idx, antenna, rssi, noise, freq, NULL);
         } else {
             fprintf(stderr, "Short packet (ieee header)\n");
             continue;
@@ -204,7 +216,7 @@ Aggregator::Aggregator(const string &client_addr, int client_port, const string 
     fec_p(NULL), fec_k(-1), fec_n(-1), seq(0), rx_ring_front(0), rx_ring_alloc(0),
     last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id),
     count_p_all(0), count_p_dec_err(0), count_p_dec_ok(0), count_p_fec_recovered(0),
-    count_p_lost(0), count_p_bad(0), count_p_override(0)
+    count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0)
 {
     sockfd = open_udp_socket_for_tx(client_addr, client_port);
     memset(session_key, '\0', sizeof(session_key));
@@ -295,12 +307,14 @@ Forwarder::Forwarder(const string &client_addr, int client_port)
 }
 
 
-void Forwarder::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna, const int8_t *rssi, sockaddr_in *sockaddr)
+void Forwarder::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna, const int8_t *rssi, const int8_t *noise, uint16_t freq, sockaddr_in *sockaddr)
 {
-    wrxfwd_t fwd_hdr = { .wlan_idx = wlan_idx };
+    wrxfwd_t fwd_hdr = { .wlan_idx = wlan_idx,
+                         .freq = freq };
 
     memcpy(fwd_hdr.antenna, antenna, RX_ANT_MAX * sizeof(uint8_t));
     memcpy(fwd_hdr.rssi, rssi, RX_ANT_MAX * sizeof(int8_t));
+    memcpy(fwd_hdr.noise, noise, RX_ANT_MAX * sizeof(int8_t));
 
     struct iovec iov[2] = {{ .iov_base = (void*)&fwd_hdr,
                              .iov_len = sizeof(fwd_hdr)},
@@ -398,13 +412,16 @@ void Aggregator::dump_stats(FILE *fp)
     //timestamp in ms
     uint64_t ts = get_time_ms();
 
-    for(antenna_stat_t::iterator it = antenna_stat.begin(); it != antenna_stat.end(); it++)
+    for(rx_antenna_stat_t::iterator it = antenna_stat.begin(); it != antenna_stat.end(); it++)
     {
-        fprintf(fp, "%" PRIu64 "\tANT\t%" PRIx64 "\t%d:%d:%d:%d\n", ts, it->first, it->second.count_all, it->second.rssi_min, it->second.rssi_sum / it->second.count_all, it->second.rssi_max);
+        fprintf(fp, "%" PRIu64 "\tRX_ANT\t%u\t%" PRIx64 "\t%d" ":%d:%d:%d" ":%d:%d:%d\n",
+                ts, it->first.freq, it->first.antenna_id, it->second.count_all,
+                it->second.rssi_min, it->second.rssi_sum / it->second.count_all, it->second.rssi_max,
+                it->second.snr_min, it->second.snr_sum / it->second.count_all, it->second.snr_max);
     }
     antenna_stat.clear();
 
-    fprintf(fp, "%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u\n", ts, count_p_all, count_p_dec_err, count_p_dec_ok, count_p_fec_recovered, count_p_lost, count_p_bad);
+    fprintf(fp, "%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u\n", ts, count_p_all, count_p_dec_err, count_p_dec_ok, count_p_fec_recovered, count_p_lost, count_p_bad, count_p_outgoing);
     fflush(fp);
 
     if(count_p_override)
@@ -424,28 +441,30 @@ void Aggregator::dump_stats(FILE *fp)
     count_p_lost = 0;
     count_p_bad = 0;
     count_p_override = 0;
+    count_p_outgoing = 0;
 }
 
 
-void Aggregator::log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const uint8_t *ant, const int8_t *rssi)
+void Aggregator::log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const uint8_t *ant, const int8_t *rssi, const int8_t *noise, uint16_t freq)
 {
     for(int i = 0; i < RX_ANT_MAX && ant[i] != 0xff; i++)
     {
-        // key: addr + port + wlan_idx + ant
-        uint64_t key = 0;
+        // antenna_id: addr + port + wlan_idx + ant
+        rxAntennaKey key = {.freq = freq, .antenna_id = 0};
+
         if (sockaddr != NULL && sockaddr->sin_family == AF_INET)
         {
-            key = ((uint64_t)ntohl(sockaddr->sin_addr.s_addr) << 32 | (uint64_t)ntohs(sockaddr->sin_port) << 16);
+            key.antenna_id = ((uint64_t)ntohl(sockaddr->sin_addr.s_addr) << 32 | (uint64_t)ntohs(sockaddr->sin_port) << 16);
         }
 
-        key |= ((uint64_t)wlan_idx << 8 | (uint64_t)ant[i]);
+        key.antenna_id |= ((uint64_t)wlan_idx << 8 | (uint64_t)ant[i]);
 
-        antenna_stat[key].log_rssi(rssi[i]);
+        antenna_stat[key].log_rssi(rssi[i], noise[i]);
     }
 }
 
 
-void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna, const int8_t *rssi, sockaddr_in *sockaddr)
+void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna, const int8_t *rssi, const int8_t *noise, uint16_t freq, sockaddr_in *sockaddr)
 {
     wsession_data_t new_session_data;
     count_p_all += 1;
@@ -498,7 +517,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
         if (be32toh(new_session_data.channel_id) != channel_id)
         {
-            fprintf(stderr, "Session channel_id doesn't match: %d != %d\n", be32toh(new_session_data.channel_id), channel_id);
+            fprintf(stderr, "Session channel_id doesn't match: %u != %u\n", be32toh(new_session_data.channel_id), channel_id);
             count_p_dec_err += 1;
             return;
         }
@@ -525,6 +544,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         }
 
         count_p_dec_ok += 1;
+        log_rssi(sockaddr, wlan_idx, antenna, rssi, noise, freq);
 
         if (memcmp(session_key, new_session_data.session_key, sizeof(session_key)) != 0)
         {
@@ -538,7 +558,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
             init_fec(new_session_data.k, new_session_data.n);
 
-            fprintf(stdout, "%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%u:%u\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n);
+            fprintf(stdout, "%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n);
             fflush(stdout);
 
         }
@@ -567,7 +587,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     }
 
     count_p_dec_ok += 1;
-    log_rssi(sockaddr, wlan_idx, antenna, rssi);
+    log_rssi(sockaddr, wlan_idx, antenna, rssi, noise, freq);
 
     assert(decrypted_len <= MAX_FEC_PAYLOAD);
 
@@ -706,6 +726,7 @@ void Aggregator::send_packet(int ring_idx, int fragment_idx)
     }else if(!(flags & WFB_PACKET_FEC_ONLY))
     {
         send(sockfd, payload, packet_size, MSG_DONTWAIT);
+        count_p_outgoing += 1;
     }
 }
 
@@ -778,11 +799,10 @@ void radio_loop(int argc, char* const *argv, int optind, uint32_t channel_id, sh
         }
 
         cur_ts = get_time_ms();
-
         if (cur_ts >= log_send_ts)
         {
             agg->dump_stats(stdout);
-            log_send_ts = get_time_ms() + log_interval;
+            log_send_ts = cur_ts + log_interval;
         }
 
         if (rc == 0) continue; // timeout expired
@@ -811,11 +831,6 @@ void network_loop(int srv_port, Aggregator &agg, int log_interval, int rcv_buf_s
     struct pollfd fds[1];
     int fd = open_udp_socket_for_rx(srv_port, rcv_buf_size);
 
-    if(fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0)
-    {
-        throw runtime_error(string_format("Unable to set socket into nonblocked mode: %s", strerror(errno)));
-    }
-
     memset(fds, '\0', sizeof(fds));
     fds[0].fd = fd;
     fds[0].events = POLLIN;
@@ -831,11 +846,10 @@ void network_loop(int srv_port, Aggregator &agg, int log_interval, int rcv_buf_s
         }
 
         cur_ts = get_time_ms();
-
         if (cur_ts >= log_send_ts)
         {
             agg.dump_stats(stdout);
-            log_send_ts = get_time_ms() + log_interval;
+            log_send_ts = cur_ts + log_interval;
         }
 
         if (rc == 0) continue; // timeout expired
@@ -865,7 +879,7 @@ void network_loop(int srv_port, Aggregator &agg, int log_interval, int rcv_buf_s
                                          .msg_controllen = 0,
                                          .msg_flags = 0};
 
-                ssize_t rsize = recvmsg(fd, &msghdr, 0);
+                ssize_t rsize = recvmsg(fd, &msghdr, MSG_DONTWAIT);
                 if (rsize < 0)
                 {
                     break;
@@ -876,7 +890,7 @@ void network_loop(int srv_port, Aggregator &agg, int log_interval, int rcv_buf_s
                     fprintf(stderr, "Short packet (rx fwd header)\n");
                     continue;
                 }
-                agg.process_packet(buf, rsize - sizeof(wrxfwd_t), fwd_hdr.wlan_idx, fwd_hdr.antenna, fwd_hdr.rssi, &sockaddr);
+                agg.process_packet(buf, rsize - sizeof(wrxfwd_t), fwd_hdr.wlan_idx, fwd_hdr.antenna, fwd_hdr.rssi, fwd_hdr.noise, fwd_hdr.freq, &sockaddr);
             }
             if(errno != EWOULDBLOCK) throw runtime_error(string_format("Error receiving packet: %s", strerror(errno)));
         }

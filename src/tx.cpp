@@ -1,6 +1,6 @@
 // -*- C++ -*-
 //
-// Copyright (C) 2017 - 2022 Vasily Evseenko <svpcom@p2ptech.org>
+// Copyright (C) 2017 - 2024 Vasily Evseenko <svpcom@p2ptech.org>
 
 /*
  *   This program is free software; you can redistribute it and/or modify
@@ -25,10 +25,12 @@
 #include <poll.h>
 #include <time.h>
 #include <sys/resource.h>
-#include <pcap/pcap.h>
 #include <assert.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <net/if.h>
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
 #include <linux/random.h>
 #include <inttypes.h>
 
@@ -122,89 +124,153 @@ void Transmitter::make_session_key(void)
     }
 }
 
-
-PcapTransmitter::PcapTransmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, const vector<string> &wlans) : \
+RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, const vector<string> &wlans) : \
     Transmitter(k, n, keypair, epoch, channel_id),
     channel_id(channel_id),
     current_output(0),
     ieee80211_seq(0)
 {
-    char errbuf[PCAP_ERRBUF_SIZE];
     for(auto it=wlans.begin(); it!=wlans.end(); it++)
     {
-        pcap_t *p = pcap_create(it->c_str(), errbuf);
-        if (p == NULL){
-            throw runtime_error(string_format("Unable to open interface %s in pcap: %s", it->c_str(), errbuf));
+        int fd = socket(PF_PACKET, SOCK_RAW, 0);
+        if (fd < 0)
+        {
+            throw runtime_error(string_format("Unable to open PF_PACKET socket: %s", strerror(errno)));
         }
-        if (pcap_set_snaplen(p, 4096) !=0) throw runtime_error("set_snaplen failed");
-        if (pcap_set_promisc(p, 1) != 0) throw runtime_error("set_promisc failed");
-        //if (pcap_set_rfmon(p, 1) !=0) throw runtime_error("set_rfmon failed");
-        if (pcap_set_timeout(p, -1) !=0) throw runtime_error("set_timeout failed");
-        //if (pcap_set_buffer_size(p, 2048) !=0) throw runtime_error("set_buffer_size failed");
-        if (pcap_set_immediate_mode(p, 1) != 0) throw runtime_error(string_format("pcap_set_immediate_mode failed: %s", pcap_geterr(p)));
-        if (pcap_activate(p) !=0) throw runtime_error(string_format("pcap_activate failed: %s", pcap_geterr(p)));
-        //if (pcap_setnonblock(p, 1, errbuf) != 0) throw runtime_error(string_format("set_nonblock failed: %s", errbuf));
 
-        ppcap.push_back(p);
+        const int optval = 1;
+        if(setsockopt(fd, SOL_PACKET, PACKET_QDISC_BYPASS, (const void *)&optval , sizeof(optval)) !=0)
+        {
+            close(fd);
+            throw runtime_error(string_format("Unable to set PACKET_QDISC_BYPASS: %s", strerror(errno)));
+        }
+
+        struct ifreq ifr;
+        memset(&ifr, '\0', sizeof(ifr));
+        strncpy(ifr.ifr_name, it->c_str(), sizeof(ifr.ifr_name) - 1);
+
+        if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0)
+        {
+            close(fd);
+            throw runtime_error(string_format("Unable to get interface index for %s: %s", it->c_str(), strerror(errno)));
+        }
+
+        struct sockaddr_ll sll;
+        memset(&sll, '\0', sizeof(sll));
+        sll.sll_family = AF_PACKET;
+        sll.sll_ifindex = ifr.ifr_ifindex;
+        sll.sll_protocol = 0;
+
+        if (bind(fd, (struct sockaddr *) &sll, sizeof(sll)) < 0)
+        {
+            close(fd);
+            throw runtime_error(string_format("Unable to bind to %s: %s", it->c_str(), strerror(errno)));
+        }
+
+        sockfds.push_back(fd);
     }
 }
 
-
-void PcapTransmitter::inject_packet(const uint8_t *buf, size_t size)
+void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
 {
-    uint8_t txbuf[MAX_PACKET_SIZE];
-    uint8_t *p = txbuf;
-
     assert(size <= MAX_FORWARDER_PACKET_SIZE);
 
-    // radiotap header
-    memcpy(p, radiotap_header, sizeof(radiotap_header));
-    p += sizeof(radiotap_header);
-
-    // ieee80211 header
-    memcpy(p, ieee80211_header, sizeof(ieee80211_header));
+    uint8_t ieee_hdr[sizeof(ieee80211_header)];
+    memcpy(ieee_hdr, ieee80211_header, sizeof(ieee80211_header));
 
     // channel_id
     uint32_t channel_id_be = htobe32(channel_id);
-    memcpy(p + SRC_MAC_THIRD_BYTE, &channel_id_be, sizeof(uint32_t));
-    memcpy(p + DST_MAC_THIRD_BYTE, &channel_id_be, sizeof(uint32_t));
+    memcpy(ieee_hdr + SRC_MAC_THIRD_BYTE, &channel_id_be, sizeof(uint32_t));
+    memcpy(ieee_hdr + DST_MAC_THIRD_BYTE, &channel_id_be, sizeof(uint32_t));
 
     // sequence number
-    p[FRAME_SEQ_LB] = ieee80211_seq & 0xff;
-    p[FRAME_SEQ_HB] = (ieee80211_seq >> 8) & 0xff;
+    ieee_hdr[FRAME_SEQ_LB] = ieee80211_seq & 0xff;
+    ieee_hdr[FRAME_SEQ_HB] = (ieee80211_seq >> 8) & 0xff;
     ieee80211_seq += 16;
-    p += sizeof(ieee80211_header);
 
-    // FEC data
-    memcpy(p, buf, size);
-    p += size;
+    struct iovec iov[3] = \
+        {
+            // radiotap header
+            { .iov_base = (void*)radiotap_header,
+              .iov_len = sizeof(radiotap_header)
+            },
+            // ieee80211 header
+            { .iov_base = (void*)ieee_hdr,
+              .iov_len = sizeof(ieee_hdr)
+            },
+            // packet payload
+            { .iov_base = (void*)buf,
+              .iov_len = size
+            }
+        };
+
+    struct msghdr msghdr = \
+        { .msg_name = NULL,
+          .msg_namelen = 0,
+          .msg_iov = iov,
+          .msg_iovlen = 3,
+          .msg_control = NULL,
+          .msg_controllen = 0,
+          .msg_flags = 0};
 
     if (current_output >= 0)
     {
-        // Normal mode
-        if (pcap_inject(ppcap[current_output], txbuf, p - txbuf) != p - txbuf)
+        // Normal mode - only one card do packet transmission in a time
+        uint64_t start_us = get_time_us();
+        int rc = sendmsg(sockfds[current_output], &msghdr, 0);
+
+        if (rc < 0 && errno != ENOBUFS)
         {
-            throw runtime_error(string_format("Unable to inject packet"));
+            throw runtime_error(string_format("Unable to inject packet: %s", strerror(errno)));
         }
+
+        uint64_t key = (uint64_t)(current_output) << 8 | (uint64_t)0xff;
+        antenna_stat[key].log_latency(get_time_us() - start_us, rc >= 0);
     }
     else
     {
         // Mirror mode - transmit packet via all cards
         // Use only for different frequency channels
-        for(auto it=ppcap.begin(); it != ppcap.end(); it++)
+        int i = 0;
+        for(auto it=sockfds.begin(); it != sockfds.end(); it++, i++)
         {
-            if (pcap_inject(*it, txbuf, p - txbuf) != p - txbuf)
+            uint64_t start_us = get_time_us();
+            int rc = sendmsg(*it, &msghdr, 0);
+
+            if (rc < 0 && errno != ENOBUFS)
             {
-                throw runtime_error(string_format("Unable to inject packet"));
+                throw runtime_error(string_format("Unable to inject packet: %s", strerror(errno)));
             }
+
+            uint64_t key = (uint64_t)(i) << 8 | (uint64_t)0xff;
+            antenna_stat[key].log_latency(get_time_us() - start_us, rc >= 0);
         }
     }
+
 }
 
-PcapTransmitter::~PcapTransmitter()
+void RawSocketTransmitter::dump_stats(FILE *fp, uint64_t ts, uint32_t &injected, uint32_t &dropped)
 {
-    for(auto it=ppcap.begin(); it != ppcap.end(); it++){
-        pcap_close(*it);
+    for(tx_antenna_stat_t::iterator it = antenna_stat.begin(); it != antenna_stat.end(); it++)
+    {
+        fprintf(fp, "%" PRIu64 "\tTX_ANT\t%" PRIx64 "\t%u:%u:%" PRIu64 ":%" PRIu64 ":%" PRIu64 "\n",
+                ts, it->first,
+                it->second.count_injected, it->second.count_dropped,
+                it->second.latency_min,
+                it->second.latency_sum / (it->second.count_injected + it->second.count_dropped),
+                it->second.latency_max);
+
+        injected += it->second.count_injected;
+        dropped += it->second.count_dropped;
+    }
+    antenna_stat.clear();
+}
+
+RawSocketTransmitter::~RawSocketTransmitter()
+{
+    for(auto it=sockfds.begin(); it != sockfds.end(); it++)
+    {
+        close(*it);
     }
 }
 
@@ -238,28 +304,29 @@ void Transmitter::send_session_key(void)
     inject_packet((uint8_t*)session_key_packet, sizeof(session_key_packet));
 }
 
-void Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
 {
-    wpacket_hdr_t packet_hdr;
     assert(size <= MAX_PAYLOAD_SIZE);
 
     // FEC-only packets are only for closing already opened blocks
     if (fragment_idx == 0 && flags & WFB_PACKET_FEC_ONLY)
     {
-        return;
+        return false;
     }
 
-    packet_hdr.packet_size = htobe16(size);
-    packet_hdr.flags = flags;
-    memset(block[fragment_idx], '\0', MAX_FEC_PAYLOAD);
-    memcpy(block[fragment_idx], &packet_hdr, sizeof(packet_hdr));
-    memcpy(block[fragment_idx] + sizeof(packet_hdr), buf, size);
+    wpacket_hdr_t *packet_hdr = (wpacket_hdr_t*)block[fragment_idx];
 
-    send_block_fragment(sizeof(packet_hdr) + size);
-    max_packet_size = max(max_packet_size, sizeof(packet_hdr) + size);
+    packet_hdr->flags = flags;
+    packet_hdr->packet_size = htobe16(size);
+
+    memcpy(block[fragment_idx] + sizeof(wpacket_hdr_t), buf, size);
+    memset(block[fragment_idx] + sizeof(wpacket_hdr_t) + size, '\0', MAX_FEC_PAYLOAD - (sizeof(wpacket_hdr_t) + size));
+
+    send_block_fragment(sizeof(wpacket_hdr_t) + size);
+    max_packet_size = max(max_packet_size, sizeof(wpacket_hdr_t) + size);
     fragment_idx += 1;
 
-    if (fragment_idx < fec_k)  return;
+    if (fragment_idx < fec_k)  return true;
 
     fec_encode(fec_p, (const uint8_t**)block, block + fec_k, max_packet_size);
     while (fragment_idx < fec_n)
@@ -278,6 +345,8 @@ void Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
         send_session_key();
         block_idx = 0;
     }
+
+    return true;
 }
 
 // Extract SO_RXQ_OVFL counter
@@ -295,63 +364,115 @@ uint32_t extract_rxq_overflow(struct msghdr *msg)
     return 0;
 }
 
-void data_source(shared_ptr<Transmitter> &t, vector<int> &rx_fd, int poll_timeout, bool mirror)
+void data_source(shared_ptr<Transmitter> &t, vector<int> &rx_fd, int fec_timeout, bool mirror, int log_interval)
 {
     int nfds = rx_fd.size();
+    assert(nfds > 0);
+
     struct pollfd fds[nfds];
     memset(fds, '\0', sizeof(fds));
 
-    int i = 0;
-    for(auto it=rx_fd.begin(); it != rx_fd.end(); it++, i++)
+    for(size_t i=0; i < rx_fd.size(); i++)
     {
-        int fd = *it;
-        if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0)
-        {
-            throw runtime_error(string_format("Unable to set socket into nonblocked mode: %s", strerror(errno)));
-        }
-
-        fds[i].fd = fd;
+        fds[i].fd = rx_fd[i];
         fds[i].events = POLLIN;
     }
 
     uint64_t session_key_announce_ts = 0;
     uint32_t rxq_overflow = 0;
+    uint64_t log_send_ts = 0;
+    uint64_t fec_close_ts = fec_timeout > 0 ? get_time_ms() + fec_timeout : 0;
+    uint32_t count_p_fec_timeouts = 0; // empty packets sent to close fec block due to timeout
+    uint32_t count_p_incoming = 0;   // incoming udp packets (received + dropped due to rxq overflow)
+    uint32_t count_p_injected = 0;  // successfully injected (include additional fec packets)
+    uint32_t count_p_dropped = 0;   // dropped due to rxq overflows or injection timeout
+    uint32_t count_p_truncated = 0; // injected large packets that were truncated
+    int start_fd_idx = 0;
 
     for(;;)
     {
-        int rc = poll(fds, nfds, poll_timeout > 0 ? poll_timeout : -1);
+        uint64_t cur_ts = get_time_ms();
+        int poll_timeout = log_send_ts > cur_ts ? log_send_ts - cur_ts : 0;
 
-        if (rc < 0){
+        if (fec_timeout > 0)
+        {
+            poll_timeout = std::min(poll_timeout, (int)(fec_close_ts > cur_ts ? fec_close_ts - cur_ts : 0));
+        }
+
+        int rc = poll(fds, nfds, poll_timeout);
+
+        if (rc < 0)
+        {
             if (errno == EINTR || errno == EAGAIN) continue;
             throw runtime_error(string_format("poll error: %s", strerror(errno)));
         }
 
-        if (rc == 0) // timeout expired
+        cur_ts = get_time_ms();
+
+        if (cur_ts >= log_send_ts)  // log timeout expired
         {
-            t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY);
+            t->dump_stats(stdout, cur_ts, count_p_injected, count_p_dropped);
+
+            fprintf(stdout, "%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u\n",
+                    cur_ts, count_p_fec_timeouts, count_p_incoming, count_p_injected, count_p_dropped, count_p_truncated);
+            fflush(stdout);
+
+            if(count_p_dropped)
+            {
+                fprintf(stderr, "%u packets dropped\n", count_p_dropped);
+            }
+
+            if(count_p_truncated)
+            {
+                fprintf(stderr, "%u packets truncated\n", count_p_truncated);
+            }
+
+            count_p_fec_timeouts = 0;
+            count_p_incoming = 0;
+            count_p_injected = 0;
+            count_p_dropped = 0;
+            count_p_truncated = 0;
+
+            log_send_ts = cur_ts + log_interval;
+        }
+
+        if (rc == 0) // poll timeout
+        {
+            // close fec only if no data packets and fec timeout expired
+            if (fec_timeout > 0 && cur_ts >= fec_close_ts)
+            {
+                if(!t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY))
+                {
+                    count_p_fec_timeouts += 1;
+                }
+                fec_close_ts = cur_ts + fec_timeout;
+            }
             continue;
         }
 
-        for(i = 0; i < nfds; i++)
+        // rc > 0: events detected
+
+        // start from last fd index and reset it to zero
+        int i = start_fd_idx;
+        for(start_fd_idx = 0; rc > 0; i++)
         {
-            // some events detected
-            if (fds[i].revents & (POLLERR | POLLNVAL))
+            if (fds[i % nfds].revents & (POLLERR | POLLNVAL))
             {
                 throw runtime_error(string_format("socket error: %s", strerror(errno)));
             }
 
-            if (fds[i].revents & POLLIN)
+            if (fds[i % nfds].revents & POLLIN)
             {
                 uint8_t buf[MAX_PAYLOAD_SIZE + 1];
                 ssize_t rsize;
                 uint8_t cmsgbuf[CMSG_SPACE(sizeof(uint32_t))];
+                rc -= 1;
 
-                int fd = rx_fd[i];
-
-                t->select_output(mirror ? -1 : i);
+                t->select_output(mirror ? -1 : (i % nfds));
 
                 for(;;)
                 {
+                    int fd = fds[i % nfds].fd;
                     struct iovec iov = { .iov_base = (void*)buf,
                                          .iov_len = sizeof(buf) };
 
@@ -365,35 +486,54 @@ void data_source(shared_ptr<Transmitter> &t, vector<int> &rx_fd, int poll_timeou
 
                     memset(cmsgbuf, '\0', sizeof(cmsgbuf));
 
-                    if ((rsize = recvmsg(fd, &msghdr, 0)) < 0)
+                    if ((rsize = recvmsg(fd, &msghdr, MSG_DONTWAIT)) < 0)
                     {
+                        if (errno != EWOULDBLOCK) throw runtime_error(string_format("Error receiving packet: %s", strerror(errno)));
                         break;
                     }
 
+                    count_p_incoming += 1;
+
                     if (rsize > (ssize_t)MAX_PAYLOAD_SIZE)
                     {
-                        fprintf(stderr, "Incoming packet size > %" PRIu64 " and will be truncated\n", MAX_PAYLOAD_SIZE);
                         rsize = MAX_PAYLOAD_SIZE;
+                        count_p_truncated += 1;
                     }
 
                     uint32_t cur_rxq_overflow = extract_rxq_overflow(&msghdr);
                     if (cur_rxq_overflow != rxq_overflow)
                     {
-                        fprintf(stderr, "UDP rxq overflow: %u packets dropped\n", cur_rxq_overflow - rxq_overflow);
+                        // Count dropped packets as possible incoming
+                        count_p_dropped += (cur_rxq_overflow - rxq_overflow);
+                        count_p_incoming += (cur_rxq_overflow - rxq_overflow);
                         rxq_overflow = cur_rxq_overflow;
                     }
 
                     uint64_t cur_ts = get_time_ms();
+
                     if (cur_ts >= session_key_announce_ts)
                     {
                         // Announce session key
                         t->send_session_key();
                         session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                     }
+
                     t->send_packet(buf, rsize, 0);
+
+                    if (cur_ts >= log_send_ts)  // log timeout expired
+                    {
+                        // We need to transmit all packets from the queue before tx card switch
+                        start_fd_idx = i % nfds;
+                        break;
+                    }
                 }
-                if (errno != EWOULDBLOCK) throw runtime_error(string_format("Error receiving packet: %s", strerror(errno)));
             }
+        }
+
+        // reset fec timeout if data arrived
+        if(fec_timeout > 0)
+        {
+            fec_close_ts = get_time_ms() + fec_timeout;
         }
     }
 }
@@ -406,6 +546,7 @@ int main(int argc, char * const *argv)
     uint32_t link_id = 0x0;
     uint64_t epoch = 0;
     int udp_port=5600;
+    int log_interval = 1000;
 
     int bandwidth = 20;
     int short_gi = 0;
@@ -413,12 +554,12 @@ int main(int argc, char * const *argv)
     int ldpc = 0;
     int mcs_index = 1;
     int debug_port = 0;
-    int poll_timeout = 0;
+    int fec_timeout = 0;
     int rcv_buf = 0;
     bool mirror = false;
     string keypair = "tx.key";
 
-    while ((opt = getopt(argc, argv, "K:k:n:u:p:B:G:S:L:M:D:T:i:e:R:f:m")) != -1) {
+    while ((opt = getopt(argc, argv, "K:k:n:u:p:l:B:G:S:L:M:D:T:i:e:R:f:m")) != -1) {
         switch (opt) {
         case 'K':
             keypair = optarg;
@@ -457,7 +598,10 @@ int main(int argc, char * const *argv)
             debug_port = atoi(optarg);
             break;
         case 'T':
-            poll_timeout = atoi(optarg);
+            fec_timeout = atoi(optarg);
+            break;
+        case 'l':
+            log_interval = atoi(optarg);
             break;
         case 'i':
             link_id = ((uint32_t)atoi(optarg)) & 0xffffff;
@@ -487,10 +631,10 @@ int main(int argc, char * const *argv)
             break;
         default: /* '?' */
         show_usage:
-            fprintf(stderr, "Usage: %s [-K tx_key] [-k RS_K] [-n RS_N] [-u udp_port] [-R rcv_buf] [-p radio_port] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-T poll_timeout] [-e epoch] [-i link_id] [-f { data | rts }] [ -m ] interface1 [interface2] ...\n",
+            fprintf(stderr, "Usage: %s [-K tx_key] [-k RS_K] [-n RS_N] [-u udp_port] [-R rcv_buf] [-p radio_port] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [ -m ] interface1 [interface2] ...\n",
                     argv[0]);
-            fprintf(stderr, "Default: K='%s', k=%d, n=%d, udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d, poll_timeout=%d, rcv_buf=system_default, frame_type=data, mirror=false\n",
-                    keypair.c_str(), k, n, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, poll_timeout);
+            fprintf(stderr, "Default: K='%s', k=%d, n=%d, udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, frame_type=data, mirror=false\n",
+                    keypair.c_str(), k, n, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, fec_timeout, log_interval);
             fprintf(stderr, "Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
             fprintf(stderr, "WFB-ng version " WFB_VERSION "\n");
             fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
@@ -588,7 +732,7 @@ int main(int argc, char * const *argv)
                     throw runtime_error(string_format("Unable to get socket info: %s", strerror(errno)));
                 }
                 bind_port = ntohs(saddr.sin_port);
-                printf("LISTEN_UDP\t%d:%s\n", bind_port, argv[optind + i]);
+                printf("%" PRIu64 "\tLISTEN_UDP\t%d:%s\n", get_time_ms(), bind_port, argv[optind + i]);
             }
             fprintf(stderr, "Listen on %d for %s\n", bind_port, argv[optind + i]);
             rx_fd.push_back(fd);
@@ -597,7 +741,7 @@ int main(int argc, char * const *argv)
 
         if (udp_port == 0)
         {
-            printf("LISTEN_UDP_END\n");
+            printf("%" PRIu64 "\tLISTEN_UDP_END\n", get_time_ms());
             fflush(stdout);
         }
 
@@ -610,10 +754,10 @@ int main(int argc, char * const *argv)
             fprintf(stderr, "Using %zu ports from %d for wlan emulation\n", wlans.size(), debug_port);
             t = shared_ptr<UdpTransmitter>(new UdpTransmitter(k, n, keypair, "127.0.0.1", debug_port, epoch, channel_id));
         } else {
-            t = shared_ptr<PcapTransmitter>(new PcapTransmitter(k, n, keypair, epoch, channel_id, wlans));
+            t = shared_ptr<RawSocketTransmitter>(new RawSocketTransmitter(k, n, keypair, epoch, channel_id, wlans));
         }
 
-        data_source(t, rx_fd, poll_timeout, mirror);
+        data_source(t, rx_fd, fec_timeout, mirror, log_interval);
     }catch(runtime_error &e)
     {
         fprintf(stderr, "Error: %s\n", e.what());
